@@ -10,15 +10,15 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Literal
 
 import httpx
-from hcaptcha_challenger.agents.playwright.control import AgentT
 from loguru import logger
 from playwright.async_api import BrowserContext, expect, TimeoutError, Page, FrameLocator, Locator
+from tenacity import *
 
-from services.models import EpicPlayer
-from utils import from_dict_to_model
+from epic_games.player import EpicPlayer
+from utils import from_dict_to_model, AgentG
 
 # fmt:off
 URL_CLAIM = "https://store.epicgames.com/en-US/free-games"
@@ -36,7 +36,6 @@ URL_STORE_EXPLORER_GRAPHQL = (
     '&variables={"category":"games/edition/base","comingSoon":false,"count":80,"freeGame":true,"keywords":"","sortBy":"releaseDate","sortDir":"DESC","start":0,"tag":"","withPrice":true}'
     '&extensions={"persistedQuery":{"version":1,"sha256Hash":"13a2b6787f1a20d05c75c54c78b1b8ac7c8bf4efc394edf7a5998fdf35d1adb0"}}'
 )
-
 
 # fmt:on
 
@@ -73,7 +72,7 @@ class CommonHandler:
         with suppress(Exception):
             await expect(payment_btn).to_be_attached()
         await page.wait_for_timeout(2000)
-        await payment_btn.click()
+        await payment_btn.click(timeout=6000)
 
         return wpc, payment_btn
 
@@ -89,26 +88,76 @@ class CommonHandler:
                 return True
 
     @staticmethod
+    @retry(
+        retry=retry_if_exception_type(TimeoutError),
+        wait=wait_fixed(0.5),
+        stop=stop_after_attempt(15),
+        reraise=True,
+    )
     async def insert_challenge(
-        solver: AgentT,
+        solver: AgentG,
         page: Page,
         wpc: FrameLocator,
         payment_btn: Locator,
         recur_url: str,
         is_uk: bool,
     ):
-        for _ in range(15):
-            # {{< if fall in challenge >}}
-            match await solver(window="free", recur_url=recur_url):
-                case solver.status.CHALLENGE_BACKCALL | solver.status.CHALLENGE_RETRY:
-                    await wpc.locator("//a[@class='talon_close_button']").click()
-                    await page.wait_for_timeout(1000)
-                    if is_uk:
-                        await CommonHandler.uk_confirm_order(wpc)
-                    await payment_btn.click(delay=200)
-                case solver.status.CHALLENGE_SUCCESS:
-                    await page.wait_for_url(recur_url)
-                    break
+        response = await solver.execute(window="free")
+        logger.debug("task done", sattus=f"{solver.status.CHALLENGE_SUCCESS}")
+
+        match response:
+            case solver.status.CHALLENGE_BACKCALL | solver.status.CHALLENGE_RETRY:
+                await wpc.locator("//a[@class='talon_close_button']").click()
+                await page.wait_for_timeout(1000)
+                if is_uk:
+                    await CommonHandler.uk_confirm_order(wpc)
+                await payment_btn.click(delay=200)
+            case solver.status.CHALLENGE_SUCCESS:
+                await page.wait_for_url(recur_url)
+                return
+
+    @staticmethod
+    async def empty_cart(page: Page, wait_rerender: int = 30) -> bool | None:
+        """
+        URL_CART = "https://store.epicgames.com/en-US/cart"
+        URL_WISHLIST = "https://store.epicgames.com/en-US/wishlist"
+        //span[text()='Your Cart is empty.']
+
+        Args:
+            wait_rerender:
+            page:
+
+        Returns:
+
+        """
+        has_paid_free = False
+
+        try:
+            # Check all items in the shopping cart
+            cards = await page.query_selector_all("//div[@data-testid='offer-card-layout-wrapper']")
+
+            # Move paid games to wishlist games
+            for card in cards:
+                is_free = await card.query_selector("//span[text()='Free']")
+                if not is_free:
+                    has_paid_free = True
+                    wishlist_btn = await card.query_selector(
+                        "//button//span[text()='Move to wishlist']"
+                    )
+                    await wishlist_btn.click()
+
+            # Wait up to 60 seconds for the page to re-render.
+            # Usually it takes 1~3s for the web page to be re-rendered
+            # - Set threshold for overflow in case of poor Epic network
+            # - It can also prevent extreme situations, such as: the user’s shopping cart has nearly a hundred products
+            if has_paid_free and wait_rerender:
+                wait_rerender -= 1
+                await page.wait_for_timeout(2000)
+                return await CommonHandler.empty_cart(page, wait_rerender)
+            return True
+        except TimeoutError as err:
+            logger.warning("Failed to empty shopping cart", err=err)
+            return False
 
 
 @dataclass
@@ -118,7 +167,7 @@ class EpicGames:
     Agent control
     """
 
-    _solver: AgentT = None
+    _solver: AgentG = None
     """
     Module for anti-captcha
     """
@@ -135,7 +184,7 @@ class EpicGames:
     ):
         """尽可能早地实例化，用于部署 captcha 事件监听器"""
         return cls(
-            player=player, _solver=AgentT.from_page(page=page, tmp_dir=tmp_dir, **solver_opt)
+            player=player, _solver=AgentG.from_page(page=page, tmp_dir=tmp_dir, **solver_opt)
         )
 
     @property
@@ -148,27 +197,25 @@ class EpicGames:
         return self._promotions
 
     async def _login(self, page: Page) -> str | None:
-        await page.goto(URL_CLAIM, wait_until="domcontentloaded")
-        while await page.locator('a[role="button"]:has-text("Sign In")').count() > 0:
-            await page.goto(URL_LOGIN, wait_until="domcontentloaded")
-            logger.info("login", url=page.url)
-            await page.click("#login-with-epic")
-            logger.info("login-with-epic", url=page.url)
-            await page.fill("#email", self.player.email)
-            await page.type("#password", self.player.password)
-            await page.click("#sign-in")
-
+        async def insert_challenge(stage: Literal["email_exists_prod", "login_prod"]):
             fall_in_challenge = False
 
             for _ in range(15):
-                if not fall_in_challenge:
-                    with suppress(TimeoutError):
-                        await page.wait_for_url(URL_CART_SUCCESS, timeout=3000)
-                        break
-                    logger.debug("claim_weekly_games", action="handle challenge")
+                if stage == "login_prod":
+                    if not fall_in_challenge:
+                        with suppress(TimeoutError):
+                            await page.wait_for_url(URL_CART_SUCCESS, timeout=3000)
+                            break
+                        logger.debug("Attack challenge", stage=stage)
+                elif stage == "email_exists_prod":
+                    if not fall_in_challenge:
+                        with suppress(TimeoutError):
+                            await page.type("#password", "", timeout=3000)
+                            break
+                        logger.debug("Attack challenge", stage=stage)
                 fall_in_challenge = True
-                result = await self._solver(window="login", recur_url=URL_CLAIM)
-                logger.debug("handle challenge", result=result)
+                result = await self._solver.execute(window=stage)
+                logger.debug("Parse result", stage=stage, result=result)
                 match result:
                     case self._solver.status.CHALLENGE_BACKCALL:
                         await page.click("//a[@class='talon_close_button']")
@@ -177,22 +224,49 @@ class EpicGames:
                     case self._solver.status.CHALLENGE_RETRY:
                         continue
                     case self._solver.status.CHALLENGE_SUCCESS:
+                        if stage == "signin" and not self._solver.qr_queue.empty():
+                            continue
                         with suppress(TimeoutError):
                             await page.wait_for_url(URL_CLAIM)
                             break
                         return
 
-        logger.success("login", result="token has not expired")
+        await page.goto(URL_CLAIM, wait_until="domcontentloaded")
+        if "false" == await page.locator("//egs-navigation").get_attribute("isloggedin"):
+            await page.goto(URL_LOGIN, wait_until="domcontentloaded")
+            logger.info("login-with-email", url=page.url)
+
+            # {{< SIGN IN PAGE >}}
+            await page.fill("#email", self.player.email)
+            await page.click("//button[@aria-label='Continue']")
+
+            # {{< INSERT CHALLENGE - email_exists_prod >}}
+            await insert_challenge(stage="email_exists_prod")
+
+            # {{< NESTED PAGE >}}
+            await page.type("#password", self.player.password)
+            await page.click("#sign-in")
+
+            # {{< INSERT CHALLENGE - login_prod >}}
+            await insert_challenge(stage="login_prod")
+
+        logger.success("login", result="Successfully refreshed tokens")
+        await page.goto(URL_CLAIM, wait_until="domcontentloaded")
         return self._solver.status.CHALLENGE_SUCCESS
 
     async def authorize(self, page: Page):
-        for _ in range(3):
-            match await self._login(page):
-                case self._solver.status.CHALLENGE_SUCCESS:
-                    return True
-                case _:
-                    continue
-        logger.critical("Failed to flush token", agent=self.__class__.__name__)
+        for i in range(3):
+            try:
+                match await self._login(page):
+                    case self._solver.status.CHALLENGE_SUCCESS:
+                        return True
+                    case _:
+                        continue
+            except TimeoutError:
+                logger.warning("执行超时", task="authorize", retry=i)
+                continue
+
+        raise RuntimeError(f"Failed to flush token - agent={self.__class__.__name__}")
 
     async def flush_token(self, context: BrowserContext) -> Dict[str, str] | None:
         page = context.pages[0]
@@ -206,6 +280,12 @@ class EpicGames:
         logger.success("flush_token", path=self.player.ctx_cookie_path)
         return cookies
 
+    @retry(
+        retry=retry_if_exception_type(TimeoutError),
+        wait=wait_fixed(0.5),
+        stop=(stop_after_delay(360) | stop_after_attempt(3)),
+        reraise=True,
+    )
     async def claim_weekly_games(self, page: Page, promotions: List[Game]):
         in_cart_nums = 0
 
@@ -236,6 +316,7 @@ class EpicGames:
 
         # --> Goto cart page
         await page.goto(URL_CART, wait_until="domcontentloaded")
+        await self.handle.empty_cart(page)
         await page.click("//button//span[text()='Check Out']")
 
         # <-- Handle Any LICENSE
@@ -257,6 +338,14 @@ class EpicGames:
         await page.wait_for_url(recur_url)
         logger.success("claim_weekly_games", action="success", url=page.url)
 
+        return True
+
+    @retry(
+        retry=retry_if_exception_type(TimeoutError),
+        wait=wait_fixed(0.5),
+        stop=(stop_after_delay(360) | stop_after_attempt(3)),
+        reraise=True,
+    )
     async def claim_bundle_games(self, page: Page, promotions: List[Game]):
         for promotion in promotions:
             logger.info("claim_bundle_games", action="go to store", url=promotion.url)
@@ -297,6 +386,8 @@ class EpicGames:
             await page.wait_for_url(recur_url)
             logger.success("claim_bundle_games", action="success", url=page.url)
 
+            return True
+
 
 def get_promotions() -> List[Game]:
     """
@@ -306,36 +397,41 @@ def get_promotions() -> List[Game]:
     <本周免费> promotion["promotions"]["promotionalOffers"]
     :return: {"pageLink1": "pageTitle1", "pageLink2": "pageTitle2", ...}
     """
+
+    def _has_discount_target(prot: dict) -> bool | None:
+        with suppress(KeyError, IndexError, TypeError):
+            offers = prot["promotions"]["promotionalOffers"][0]["promotionalOffers"]
+            for i, offer in enumerate(offers):
+                if offer["discountSetting"]["discountPercentage"] == 0:
+                    return True
+
     _promotions: List[Game] = []
 
     params = {"local": "zh-CN"}
     resp = httpx.get(URL_PROMOTIONS, params=params)
     try:
         data = resp.json()
-    except JSONDecodeError:
-        pass
+    except JSONDecodeError as err:
+        logger.error("Failed to get promotions", err=err)
     else:
         elements = data["data"]["Catalog"]["searchStore"]["elements"]
         promotions = [e for e in elements if e.get("promotions")]
-        # 获取商城促销数据&&获取<本周免费>的游戏对象
+        # Get store promotion data and <this week free> games
         for promotion in promotions:
-            if offer := promotion["promotions"]["promotionalOffers"]:
-                # 去除打折了但只打一点点的商品
-                with suppress(KeyError, IndexError):
-                    offer = offer[0]["promotionalOffers"][0]
-                    if offer["discountSetting"]["discountPercentage"] != 0:
-                        continue
-                try:
-                    query = promotion["catalogNs"]["mappings"][0]["pageSlug"]
-                    promotion["url"] = f"{URL_PRODUCT_PAGE}{query}"
-                except TypeError:
-                    promotion["url"] = f"{URL_PRODUCT_BUNDLES}{promotion['productSlug']}"
-                except IndexError:
-                    promotion["url"] = f"{URL_PRODUCT_PAGE}{promotion['productSlug']}"
+            # Remove items that are discounted but not free.
+            if not _has_discount_target(promotion):
+                continue
+            # package free games
+            try:
+                query = promotion["catalogNs"]["mappings"][0]["pageSlug"]
+                promotion["url"] = f"{URL_PRODUCT_PAGE}{query}"
+            except TypeError:
+                promotion["url"] = f"{URL_PRODUCT_BUNDLES}{promotion['productSlug']}"
+            except IndexError:
+                promotion["url"] = f"{URL_PRODUCT_PAGE}{promotion['productSlug']}"
 
-                promotion["thumbnail"] = promotion["keyImages"][-1]["url"]
-
-                _promotions.append(from_dict_to_model(Game, promotion))
+            promotion["thumbnail"] = promotion["keyImages"][-1]["url"]
+            _promotions.append(from_dict_to_model(Game, promotion))
 
     return _promotions
 
